@@ -1,0 +1,50 @@
+# =============================================================
+# Security System — .gitignore
+# =============================================================
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Trained model weights (too large for GitHub — store separately)
+models/*.pt
+models/*.onnx
+
+# Datasets (too large — download via dataset_downloader.py)
+datasets/
+
+# Training outputs
+runs/
+results/
+
+# Alert screenshots & logs
+alerts/
+logs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+download_fire.py
+datasets/fire_tmp/
+datasets/activity/_kaggle_tmp/
+
+# Kaggle credentials (never commit these)
+kaggle.json

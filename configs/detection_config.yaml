@@ -1,0 +1,117 @@
+# ============================================================
+# detection_config.yaml
+# Central configuration for Real-Time Activity Detection System
+# ============================================================
+
+# --- Camera / Source ---
+camera:
+  source: 0                      # 0=webcam, or "rtsp://user:pass@ip:port/stream"
+  width: 1280
+  height: 720
+  fps_target: 30
+  buffer_size: 2                 # Frame buffer for threaded capture
+
+# --- Model Paths ---
+models:
+  fire:
+    weights: "models/fire_detector.pt"
+    conf_threshold: 0.45
+    iou_threshold: 0.45
+    classes: ["fire", "smoke"]
+    img_size: 640
+
+  weapon:
+    weights: "models/weapon_detector.pt"
+    conf_threshold: 0.50
+    iou_threshold: 0.45
+    classes: ["pistol", "knife"]
+    img_size: 640
+
+  person:
+    weights: "yolov8m.pt"        # Downloaded automatically by Ultralytics
+    conf_threshold: 0.40
+    iou_threshold: 0.45
+    img_size: 640
+    person_class_id: 0           # COCO class 0 = person
+
+  activity:
+    weights: "models/activity_classifier.pt"
+    sequence_length: 16          # Frames fed to LSTM
+    classes: ["normal", "running_panic", "violence", "suspicious"]
+    conf_threshold: 0.60
+    img_size: 112                # Resize each frame for CNN backbone
+
+# --- Tracking ---
+tracking:
+  tracker: "bytetrack"           # Built into Ultralytics
+  track_high_thresh: 0.5
+  track_low_thresh: 0.1
+  new_track_thresh: 0.6
+  track_buffer: 30
+  match_thresh: 0.8
+
+# --- Alert System ---
+alerts:
+  screenshot_dir: "alerts"
+  log_dir: "logs"
+  log_file: "logs/detections.log"
+  debounce_seconds: 3.0          # Min seconds between repeat alerts per track ID
+  # Consecutive frame requirement before triggering alert (false positive reduction)
+  consecutive_frames_required: 3
+
+# --- Overlap / Proximity ---
+overlap:
+  # IoU threshold for "weapon/fire on person" check
+  on_person_iou_threshold: 0.05  # Low because weapons may partially overlap
+  # Or use proximity check: expand person box by this factor before checking
+  person_box_expand_factor: 1.1
+
+# --- Training ---
+training:
+  fire:
+    data_yaml: "datasets/fire/data.yaml"
+    epochs: 60
+    batch_size: 16
+    img_size: 640
+    base_model: "yolov8m.pt"
+    patience: 15                 # Early stopping patience
+    lr0: 0.01
+    lrf: 0.01
+    optimizer: "AdamW"
+    workers: 4
+    save_dir: "results/fire_training"
+
+  weapon:
+    data_yaml: "datasets/weapon/data.yaml"
+    epochs: 80
+    batch_size: 16
+    img_size: 640
+    base_model: "yolov8m.pt"
+    patience: 20
+    lr0: 0.01
+    lrf: 0.01
+    optimizer: "AdamW"
+    workers: 4
+    save_dir: "results/weapon_training"
+
+  activity:
+    data_dir: "datasets/activity"
+    epochs: 50
+    batch_size: 8
+    sequence_length: 16
+    img_size: 112
+    lr: 0.0003
+    weight_decay: 0.0001
+    patience: 10
+    workers: 4
+    save_dir: "results/activity_training"
+
+# --- Device ---
+device: "auto"                   # "auto", "cuda", "cpu", "mps"
+
+# --- ONNX Export (optional) ---
+onnx:
+  enabled: false
+  opset: 17
+  dynamic: false
+  simplify: true
