@@ -200,10 +200,16 @@ class ThreadedCapture:
 class DetectionPipeline:
     """Orchestrates all models for real-time inference on incoming frames."""
 
-    def __init__(self, cfg: dict, device: torch.device, dry_run: bool = False):
+    def __init__(self, cfg: dict, device: torch.device, dry_run: bool = False,
+                 skip_frames: int = 3):
         self.cfg = cfg
         self.device = device
         self.dry_run = dry_run
+        self.skip_frames = skip_frames     # Run fire/weapon every N frames
+        self._frame_idx = 0
+        self._last_fire_dets: list[dict] = []
+        self._last_weapon_dets: list[dict] = []
+        self._half = device.type == "cuda"  # FP16 on GPU
 
         if not dry_run:
             self._load_models()
@@ -249,7 +255,7 @@ class DetectionPipeline:
         logger.info("All models loaded.")
 
     def _detect_persons(self, frame: np.ndarray) -> list[dict]:
-        """Run person detection + ByteTrack tracking."""
+        """Run person detection + ByteTrack tracking every frame."""
         cfg_p = self.cfg["models"]["person"]
         results = self.person_model.track(
             frame,
@@ -259,6 +265,7 @@ class DetectionPipeline:
             classes=[cfg_p["person_class_id"]],
             imgsz=cfg_p["img_size"],
             device=self.device,
+            half=self._half,
             verbose=False,
             tracker="bytetrack.yaml",
         )
@@ -285,6 +292,7 @@ class DetectionPipeline:
             iou=cfg_f["iou_threshold"],
             imgsz=cfg_f["img_size"],
             device=self.device,
+            half=self._half,
             verbose=False,
         )
         dets = []
@@ -309,6 +317,7 @@ class DetectionPipeline:
             iou=cfg_w["iou_threshold"],
             imgsz=cfg_w["img_size"],
             device=self.device,
+            half=self._half,
             verbose=False,
         )
         dets = []
@@ -394,9 +403,17 @@ class DetectionPipeline:
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
             return annotated, []
 
-        persons    = self._detect_persons(frame)
-        fire_dets  = self._detect_fire(frame)
-        weapon_dets = self._detect_weapons(frame)
+        self._frame_idx += 1
+        run_secondary = (self._frame_idx % self.skip_frames == 0)
+
+        persons = self._detect_persons(frame)
+
+        # Fire & weapon run every skip_frames frames; reuse cached results in between
+        if run_secondary:
+            self._last_fire_dets   = self._detect_fire(frame)
+            self._last_weapon_dets = self._detect_weapons(frame)
+        fire_dets   = self._last_fire_dets
+        weapon_dets = self._last_weapon_dets
 
         activity_alerts: list[dict] = []
         for person in persons:
@@ -473,7 +490,8 @@ def run(args: argparse.Namespace) -> None:
         logger.info("GPU: %s | VRAM: %.1f GB", torch.cuda.get_device_name(0),
                     torch.cuda.get_device_properties(0).total_memory / 1e9)
 
-    pipeline = DetectionPipeline(cfg=cfg, device=device, dry_run=args.dry_run)
+    pipeline = DetectionPipeline(cfg=cfg, device=device, dry_run=args.dry_run,
+                                  skip_frames=args.skip_frames)
 
     cam_cfg = cfg["camera"]
     logger.info("Opening camera source: %s", cam_cfg["source"])
@@ -559,6 +577,10 @@ def main() -> None:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Open camera without loading models (for testing camera only).",
+    )
+    parser.add_argument(
+        "--skip-frames", type=int, default=3,
+        help="Run fire/weapon detection every N frames (default=3). Higher = faster FPS.",
     )
     args = parser.parse_args()
     run(args)

@@ -6,8 +6,8 @@
 # --- Camera / Source ---
 camera:
   source: 0                      # 0=webcam, or "rtsp://user:pass@ip:port/stream"
-  width: 1280
-  height: 720
+  width: 640
+  height: 480
   fps_target: 30
   buffer_size: 2                 # Frame buffer for threaded capture
 
@@ -15,17 +15,17 @@ camera:
 models:
   fire:
     weights: "models/fire_detector.pt"
-    conf_threshold: 0.45
+    conf_threshold: 0.25
     iou_threshold: 0.45
     classes: ["fire", "smoke"]
-    img_size: 640
+    img_size: 320
 
   weapon:
     weights: "models/weapon_detector.pt"
-    conf_threshold: 0.50
+    conf_threshold: 0.30
     iou_threshold: 0.45
     classes: ["pistol", "knife"]
-    img_size: 640
+    img_size: 320
 
   person:
     weights: "yolov8m.pt"        # Downloaded automatically by Ultralytics
@@ -57,7 +57,7 @@ alerts:
   log_file: "logs/detections.log"
   debounce_seconds: 3.0          # Min seconds between repeat alerts per track ID
   # Consecutive frame requirement before triggering alert (false positive reduction)
-  consecutive_frames_required: 3
+  consecutive_frames_required: 2
 
 # --- Overlap / Proximity ---
 overlap:
