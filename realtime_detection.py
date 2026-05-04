@@ -121,15 +121,18 @@ class ActivityClassifier:
             t = self.transform(rgb)
             tensor_frames.append(t)
 
-        clip = torch.stack(tensor_frames).unsqueeze(0).to(self.device)  # (1, T, C, H, W)
+        clip = torch.stack(tensor_frames).unsqueeze(0).to(self.device).float()  # force FP32
 
-        with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
+        with torch.amp.autocast("cuda", enabled=False):   # disabled: LSTM overflows in FP16
             logits = self.model(clip)
 
         probs = torch.softmax(logits, dim=1)[0]
+        # Return all class probabilities so caller can check each independently
+        all_probs = {self.class_names[i]: float(probs[i].item()) for i in range(len(self.class_names))}
+        # Also return top class for backward compatibility
         conf, pred_idx = probs.max(dim=0)
         cls_name = self.class_names[pred_idx.item()]
-        return cls_name, conf.item()
+        return cls_name, conf.item(), all_probs
 
 
 # =============================================================================
@@ -138,28 +141,36 @@ class ActivityClassifier:
 
 class ThreadedCapture:
     """
-    Non-blocking camera frame reader.
-    Reads frames in a background thread to avoid inference blocking the camera.
+    Non-blocking camera/video frame reader.
+    - CAMERA: drops oldest frame when queue full (keeps latency low)
+    - VIDEO FILE: blocking put so no frames are dropped (plays every frame)
     """
 
     def __init__(self, source, width: int, height: int, buffer_size: int = 2):
         self._source = source
+        # Detect if source is a file or a live camera
+        self._is_file = isinstance(source, str) and not source.startswith("rtsp")
+
         # On Windows, try DirectShow backend first to avoid MSMF errors
         if isinstance(source, int):
             self._cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
             if not self._cap.isOpened():
-                self._cap = cv2.VideoCapture(source)   # fallback to default
+                self._cap = cv2.VideoCapture(source)   # fallback
         else:
             self._cap = cv2.VideoCapture(source)
 
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {source}")
 
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
+        if not self._is_file:
+            # Only set resolution/buffer for live cameras
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   buffer_size)
 
-        self._q: queue.Queue = queue.Queue(maxsize=buffer_size)
+        # Larger queue for files so blocking put doesn't stall too long
+        q_size = 64 if self._is_file else buffer_size
+        self._q: queue.Queue = queue.Queue(maxsize=q_size)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
@@ -168,17 +179,26 @@ class ThreadedCapture:
         while not self._stop_event.is_set():
             ret, frame = self._cap.read()
             if not ret:
+                # Signal end-of-stream with sentinel
+                self._q.put(None)
                 break
-            if self._q.full():
-                try:
-                    self._q.get_nowait()   # Drop oldest frame
-                except queue.Empty:
-                    pass
-            self._q.put(frame)
+            if self._is_file:
+                # Video file: blocking put — preserve every frame
+                self._q.put(frame)
+            else:
+                # Live camera: drop oldest to keep latency low
+                if self._q.full():
+                    try:
+                        self._q.get_nowait()
+                    except queue.Empty:
+                        pass
+                self._q.put(frame)
 
     def read(self) -> tuple[bool, Optional[np.ndarray]]:
         try:
-            frame = self._q.get(timeout=2.0)
+            frame = self._q.get(timeout=5.0)
+            if frame is None:          # end-of-video sentinel
+                return False, None
             return True, frame
         except queue.Empty:
             return False, None
@@ -221,8 +241,11 @@ class DetectionPipeline:
             consecutive_required=cfg["alerts"]["consecutive_frames_required"],
         )
         self.vis = Visualizer()
-        self._track_buffers: dict[int, deque] = {}
         self._seq_len = cfg["models"]["activity"]["sequence_length"]
+        self._global_frame_buffer: deque = deque(maxlen=self._seq_len * 2)
+        self._last_scene_result: tuple[str, float] = ("normal", 0.0)
+        # Motion velocity tracker (works independent of ML model)
+        self._prev_centers: dict[int, tuple[float, float]] = {}  # track_id → (cx, cy)
 
     def _load_models(self) -> None:
         """Load all YOLOv8 + CNN+LSTM models."""
@@ -332,31 +355,69 @@ class DetectionPipeline:
                 })
         return dets
 
-    def _classify_activity(self, frame: np.ndarray, person: dict) -> tuple[str, float]:
+    def _classify_scene(self, frame: np.ndarray) -> tuple[str, float]:
+        """
+        Full-frame activity classification.
+        Returns top predicted class + confidence.
+        Only triggers alert if model's TOP class is a threat (not normal).
+        Running panic is handled by _detect_running_by_motion().
+        """
         if self.dry_run or not hasattr(self, "activity_clf") or not self.activity_clf.loaded:
             return "normal", 0.0
 
-        tid = person["track_id"]
-        x1, y1, x2, y2 = [int(v) for v in person["bbox"]]
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        self._global_frame_buffer.append(frame)
 
-        if x2 <= x1 or y2 <= y1:
-            return "normal", 0.0
-
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return "normal", 0.0
-
-        if tid not in self._track_buffers:
-            self._track_buffers[tid] = deque(maxlen=self._seq_len * 2)
-        self._track_buffers[tid].append(crop)
-
-        if len(self._track_buffers[tid]) >= self._seq_len:
-            return self.activity_clf.predict(list(self._track_buffers[tid]))
+        if len(self._global_frame_buffer) >= self._seq_len:
+            cls, conf, _ = self.activity_clf.predict(list(self._global_frame_buffer))
+            self._last_scene_result = (cls, conf)
+            return cls, conf
 
         return "normal", 0.0
+
+    def _detect_running_by_motion(self, persons: list[dict], frame: np.ndarray) -> list[dict]:
+        """
+        Motion-based running detection using bounding box velocity.
+        Tracks how fast each person's center moves relative to their height.
+        Works on ANY video style regardless of training data distribution.
+        Triggers RUNNING PANIC if ≥2 persons are moving fast.
+        """
+        SPEED_THRESHOLD = 8.0   # % of person height per frame = running
+        MIN_RUNNERS = 2         # minimum fast-movers to trigger panic alert
+
+        alerts = []
+        fast_persons = []
+
+        for person in persons:
+            tid = person["track_id"]
+            x1, y1, x2, y2 = person["bbox"]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            ph = max(y2 - y1, 1)  # person height in pixels
+
+            if tid in self._prev_centers:
+                prev_cx, prev_cy = self._prev_centers[tid]
+                dist = ((cx - prev_cx) ** 2 + (cy - prev_cy) ** 2) ** 0.5
+                speed_pct = (dist / ph) * 100.0  # % of person height
+                if speed_pct >= SPEED_THRESHOLD:
+                    fast_persons.append((person, speed_pct))
+
+            self._prev_centers[tid] = (cx, cy)
+
+        # Only alert if crowd is running (≥2 persons moving fast)
+        if len(fast_persons) >= MIN_RUNNERS:
+            avg_speed = sum(s for _, s in fast_persons) / len(fast_persons)
+            # Map speed to confidence (8% → 0.50 confidence, 25%+ → 0.95)
+            conf = min(0.95, 0.50 + (avg_speed - SPEED_THRESHOLD) / 40.0)
+            for person, _ in fast_persons:
+                alerts.append({
+                    "threat_type": "RUNNING PANIC",
+                    "confidence": round(conf, 2),
+                    "bbox": person["bbox"],
+                    "track_id": person["track_id"],
+                    "near_person": True,
+                })
+
+        return alerts
 
     def _check_threat_proximity(
         self,
@@ -415,17 +476,39 @@ class DetectionPipeline:
         fire_dets   = self._last_fire_dets
         weapon_dets = self._last_weapon_dets
 
+        # ── 3. Full-frame activity classification (ML model) ─────────────────────
+        scene_class, scene_conf = self._classify_scene(frame)
+        activity_threshold = self.cfg["models"]["activity"]["conf_threshold"]
+
+        # ── 4. Motion velocity detector (complements ML — works on any video style) –
+        motion_alerts = self._detect_running_by_motion(persons, frame)
+
         activity_alerts: list[dict] = []
-        for person in persons:
-            act_class, act_conf = self._classify_activity(frame, person)
-            if act_class != "normal" and act_conf >= self.cfg["models"]["activity"]["conf_threshold"]:
+        if scene_class != "normal" and scene_conf >= activity_threshold:
+            if persons:
+                for person in persons:
+                    activity_alerts.append({
+                        "threat_type": scene_class.upper().replace("_", " "),
+                        "confidence": scene_conf,
+                        "bbox": person["bbox"],
+                        "track_id": person["track_id"],
+                        "near_person": True,
+                    })
+            else:
+                h_f, w_f = frame.shape[:2]
                 activity_alerts.append({
-                    "threat_type": act_class.upper().replace("_", " "),
-                    "confidence": act_conf,
-                    "bbox": person["bbox"],
-                    "track_id": person["track_id"],
-                    "near_person": True,
+                    "threat_type": scene_class.upper().replace("_", " "),
+                    "confidence": scene_conf,
+                    "bbox": (0, 0, w_f, h_f),
+                    "track_id": None,
+                    "near_person": False,
                 })
+
+        # Merge: prefer ML alerts; add motion alerts for persons not already covered
+        covered_ids = {a["track_id"] for a in activity_alerts}
+        for ma in motion_alerts:
+            if ma["track_id"] not in covered_ids:
+                activity_alerts.append(ma)
 
         proximity_threats = self._check_threat_proximity(
             persons, fire_dets, weapon_dets,
@@ -512,6 +595,8 @@ def run(args: argparse.Namespace) -> None:
 
     logger.info("Starting detection loop. Press Q to quit.")
     os.makedirs("alerts", exist_ok=True)
+    is_file = isinstance(cam_cfg["source"], str) and not cam_cfg["source"].startswith("rtsp")
+    no_frame_count = 0
 
     try:
         while True:
@@ -519,9 +604,17 @@ def run(args: argparse.Namespace) -> None:
 
             ret, frame = cap.read()
             if not ret or frame is None:
+                if is_file:
+                    logger.info("Video file ended.")
+                    break          # clean exit at end of video
+                no_frame_count += 1
+                if no_frame_count > 20:
+                    logger.error("Camera lost — exiting.")
+                    break
                 logger.warning("No frame received — waiting...")
                 time.sleep(0.05)
                 continue
+            no_frame_count = 0  # reset on successful read
 
             frame_count += 1
 

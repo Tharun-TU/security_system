@@ -7,8 +7,8 @@ venv/
 .venv/
 env/
 
-# Trained model weights (too large for GitHub — store separately)
-models/*.pt
+# Model weights (tracked in git — files are under 100MB)
+# models/*.pt  ← uncomment this line if you want to exclude them again
 models/*.onnx
 
 # Datasets (too large — download via dataset_downloader.py)

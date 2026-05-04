@@ -15,17 +15,17 @@ camera:
 models:
   fire:
     weights: "models/fire_detector.pt"
-    conf_threshold: 0.25
+    conf_threshold: 0.55  # Raised: real fire scores 70%+; orange backgrounds score below this
     iou_threshold: 0.45
     classes: ["fire", "smoke"]
-    img_size: 320
+    img_size: 640    # Higher res = higher confidence on clear fire
 
   weapon:
     weights: "models/weapon_detector.pt"
-    conf_threshold: 0.30
+    conf_threshold: 0.45
     iou_threshold: 0.45
     classes: ["pistol", "knife"]
-    img_size: 320
+    img_size: 512    # Good balance for small weapon objects
 
   person:
     weights: "yolov8m.pt"        # Downloaded automatically by Ultralytics
@@ -36,9 +36,9 @@ models:
 
   activity:
     weights: "models/activity_classifier.pt"
-    sequence_length: 16          # Frames fed to LSTM
-    classes: ["normal", "running_panic", "violence", "suspicious"]
-    conf_threshold: 0.60
+    sequence_length: 6           # Fills buffer faster (6 frames @ 5FPS = ~1.2s vs 2s)
+    classes: ["normal", "violence"]
+    conf_threshold: 0.50  # Raised: real violence scores 80%+; walking false positives score below this
     img_size: 112                # Resize each frame for CNN backbone
 
 # --- Tracking ---
@@ -55,9 +55,9 @@ alerts:
   screenshot_dir: "alerts"
   log_dir: "logs"
   log_file: "logs/detections.log"
-  debounce_seconds: 3.0          # Min seconds between repeat alerts per track ID
+  debounce_seconds: 2.0          # Min seconds between repeat alerts per track ID
   # Consecutive frame requirement before triggering alert (false positive reduction)
-  consecutive_frames_required: 2
+  consecutive_frames_required: 1  # Triggers on first confirmed detection (faster alerts)
 
 # --- Overlap / Proximity ---
 overlap:
